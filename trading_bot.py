@@ -151,6 +151,7 @@ def main():
 
     active_orders = {} # index -> order object
     executed_qty = [0] * len(legs)
+    last_hedged_executed_qty = [-1] * len(legs) # To track if any main leg fill occurred
 
     # Hedge Tracking: product_id -> quantity (positive for long)
     hedge_positions = {}
@@ -225,55 +226,59 @@ def main():
                             if res.get("success"): active_orders[i] = res['result']
 
             # 3. Dynamic Delta Hedging
-            # Target: total_delta + sum(hedge_qty * hedge_delta) = 0
+            # Only adjust delta if a main order execution status has changed
+            if executed_qty != last_hedged_executed_qty:
+                logger.info(f"Main leg fill detected. Adjusting hedge. (Net Delta: {total_delta:.4f})")
 
-            # Current net hedge delta
-            current_hedge_delta = 0
-            for pid, h_qty in hedge_positions.items():
-                if h_qty == 0: continue
-                # We'd need symbol to get delta. Let's simplify and always use the LATEST atm instruments.
-                pass
+                # Simplified Logic per user request:
+                # If total_delta is positive (Net Long) -> Buy ATM Puts
+                # If total_delta is negative (Net Short) -> Buy ATM Calls
 
-            # Simplified Logic per user request:
-            # If total_delta is positive (Net Long) -> Buy ATM Puts
-            # If total_delta is negative (Net Short) -> Buy ATM Calls
+                hedge_adjusted = False
 
-            if total_delta > 0.001 and atm_put:
-                ticker_h = client.get_ticker(atm_put['symbol'])
-                if ticker_h and ticker_h.get('greeks'):
-                    h_delta = float(ticker_h['greeks']['delta']) # Puts have negative delta
-                    # needed: total_delta + qty * h_delta = 0 => qty = -total_delta / h_delta
-                    target_qty = round(-total_delta / h_delta)
-                    # Current put quantity
-                    curr_put_qty = hedge_positions.get(atm_put['id'], 0)
-                    trade_qty = target_qty - curr_put_qty
-                    if abs(trade_qty) >= 1:
-                        side = "buy" if trade_qty > 0 else "sell"
-                        logger.info(f"HEDGING (Put): {side} {abs(trade_qty)} {atm_put['symbol']} (Main Delta: {total_delta:.4f})")
-                        res = client.place_order(atm_put['id'], abs(trade_qty), side, order_type="market_order")
-                        if res.get("success"): hedge_positions[atm_put['id']] = curr_put_qty + (trade_qty if side == "buy" else -trade_qty)
+                if total_delta > 0.001 and atm_put:
+                    ticker_h = client.get_ticker(atm_put['symbol'])
+                    if ticker_h and ticker_h.get('greeks'):
+                        h_delta = float(ticker_h['greeks']['delta']) # Puts have negative delta
+                        target_qty = round(-total_delta / h_delta)
+                        curr_put_qty = hedge_positions.get(atm_put['id'], 0)
+                        trade_qty = target_qty - curr_put_qty
+                        if abs(trade_qty) >= 1:
+                            side = "buy" if trade_qty > 0 else "sell"
+                            logger.info(f"HEDGING (Put): {side} {abs(trade_qty)} {atm_put['symbol']}")
+                            res = client.place_order(atm_put['id'], abs(trade_qty), side, order_type="market_order")
+                            if res.get("success"):
+                                hedge_positions[atm_put['id']] = curr_put_qty + (trade_qty if side == "buy" else -trade_qty)
+                                hedge_adjusted = True
 
-            elif total_delta < -0.001 and atm_call:
-                ticker_h = client.get_ticker(atm_call['symbol'])
-                if ticker_h and ticker_h.get('greeks'):
-                    h_delta = float(ticker_h['greeks']['delta']) # Calls have positive delta
-                    target_qty = round(-total_delta / h_delta)
-                    curr_call_qty = hedge_positions.get(atm_call['id'], 0)
-                    trade_qty = target_qty - curr_call_qty
-                    if abs(trade_qty) >= 1:
-                        side = "buy" if trade_qty > 0 else "sell"
-                        logger.info(f"HEDGING (Call): {side} {abs(trade_qty)} {atm_call['symbol']} (Main Delta: {total_delta:.4f})")
-                        res = client.place_order(atm_call['id'], abs(trade_qty), side, order_type="market_order")
-                        if res.get("success"): hedge_positions[atm_call['id']] = curr_call_qty + (trade_qty if side == "buy" else -trade_qty)
+                elif total_delta < -0.001 and atm_call:
+                    ticker_h = client.get_ticker(atm_call['symbol'])
+                    if ticker_h and ticker_h.get('greeks'):
+                        h_delta = float(ticker_h['greeks']['delta']) # Calls have positive delta
+                        target_qty = round(-total_delta / h_delta)
+                        curr_call_qty = hedge_positions.get(atm_call['id'], 0)
+                        trade_qty = target_qty - curr_call_qty
+                        if abs(trade_qty) >= 1:
+                            side = "buy" if trade_qty > 0 else "sell"
+                            logger.info(f"HEDGING (Call): {side} {abs(trade_qty)} {atm_call['symbol']}")
+                            res = client.place_order(atm_call['id'], abs(trade_qty), side, order_type="market_order")
+                            if res.get("success"):
+                                hedge_positions[atm_call['id']] = curr_call_qty + (trade_qty if side == "buy" else -trade_qty)
+                                hedge_adjusted = True
 
-            # If total delta is near zero, we might still have old hedge positions to close
-            if abs(total_delta) < 0.001:
-                for pid, h_qty in hedge_positions.items():
-                    if h_qty != 0:
-                        side = "sell" if h_qty > 0 else "buy"
-                        logger.info(f"Delta neutral. Reducing hedge in {pid}: {side} {abs(h_qty)}")
-                        res = client.place_order(pid, abs(h_qty), side, order_type="market_order")
-                        if res.get("success"): hedge_positions[pid] = 0
+                # If total delta is near zero, close old hedge positions
+                if abs(total_delta) < 0.001:
+                    for pid, h_qty in hedge_positions.items():
+                        if h_qty != 0:
+                            side = "sell" if h_qty > 0 else "buy"
+                            logger.info(f"Main delta neutral. Closing hedge in {pid}")
+                            res = client.place_order(pid, abs(h_qty), side, order_type="market_order")
+                            if res.get("success"):
+                                hedge_positions[pid] = 0
+                                hedge_adjusted = True
+
+                # Update tracker so we don't adjust again until next main fill
+                last_hedged_executed_qty = list(executed_qty)
 
             time.sleep(1)
 
