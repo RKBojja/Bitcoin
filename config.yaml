@@ -1,0 +1,8 @@
+api_key: "YOUR_API_KEY"
+api_secret: "YOUR_API_SECRET"
+quantity: 10
+expiry: "270625"
+call_buy_strike: 100000
+call_sell_strike: 105000
+put_buy_strike: 90000
+put_sell_strike: 85000
